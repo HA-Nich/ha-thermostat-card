@@ -1,0 +1,641 @@
+/*
+ * HA-Nich Thermostat Card
+ * ---------------------------------------------------------------------------
+ * A round Nest-style thermostat card for a Home Assistant heating system.
+ *
+ * WHY THIS EXISTS: the stock / HACS thermostat cards lock the big centre number
+ * to the climate entity's own `current_temperature`, which on the SONOFF TRV-ZBT
+ * is the TRV's INTERNAL probe (by the radiator). We want the TRUE room reading
+ * (a separate room sensor, away from the radiator) as the big number, and keep
+ * the TRV probe visible as a second data point. This card lets you point each
+ * value at an explicit entity.
+ *
+ *   - Big centre number   -> current_temp_entity   (the room sensor)
+ *   - Setpoint on the ring -> climate entity's target (drag / +-/ writes it)
+ *   - Small bottom tile    -> trv_temp_entity       (the TRV internal probe)
+ *   - Off / Auto buttons   -> climate hvac_mode
+ *   - Boost flame          -> boost_select (SONOFF temporary_mode_mode) via a
+ *                             script, or directly
+ *
+ * No build step: plain JS using the LitElement that Home Assistant already
+ * ships on the frontend. Drop in config/www/ and add as a dashboard resource.
+ *
+ * Example:
+ *   type: custom:ha-nich-thermostat-card
+ *   name: Bedroom 1
+ *   entity: climate.bedroom_1_trv
+ *   current_temp_entity: sensor.bedroom_1_sensor_temperature
+ *   trv_temp_entity: sensor.bedroom_1_trv_local_temperature
+ *   boost_select: select.bedroom_1_trv_temporary_mode_mode
+ *   boost_script: script.heating_boost_toggle
+ *   boost_slug: bedroom_1_trv
+ *   open_window_entity: binary_sensor.bedroom_1_trv_open_window_detected  # optional
+ *   accent: "#42a5f5"
+ */
+
+// Grab LitElement + the `html` tag from Home Assistant's own bundled Lit, so
+// this card needs no build step and no external dependencies. We resolve
+// LitElement from an element that is guaranteed to exist and be Lit-based.
+// NOTE: we do NOT use the static `css` tag at all (its availability on the
+// prototype is version-dependent and was throwing a "Configuration error");
+// styles are injected via a plain <style> block inside render() instead.
+const _LitSource =
+  customElements.get("ha-card") ||
+  customElements.get("hui-view") ||
+  customElements.get("ha-panel-lovelace");
+const LitElement = Object.getPrototypeOf(_LitSource);
+const LitHtml = LitElement.prototype.html;
+
+class HaNichThermostatCard extends LitElement {
+  static get properties() {
+    return { hass: {}, _config: {}, _dragTarget: {}, _presetMenuOpen: {}, _pending: {} };
+  }
+
+  // Optimistic UI: when the user taps a control we show the new value IMMEDIATELY
+  // (stored here) instead of waiting for HA to echo the state back over the
+  // Zigbee round-trip, which is what made the card feel laggy. Each pending
+  // value self-expires after ~4s, by which point the real state has arrived.
+  _setPending(key, value) {
+    this._pending = { ...this._pending, [key]: value };
+    clearTimeout(this._pendingTimers?.[key]);
+    this._pendingTimers = this._pendingTimers || {};
+    this._pendingTimers[key] = setTimeout(() => {
+      const p = { ...this._pending };
+      delete p[key];
+      this._pending = p;
+    }, 4000);
+  }
+
+  _pend(key, fallback) {
+    return this._pending && key in this._pending ? this._pending[key] : fallback;
+  }
+
+  setConfig(config) {
+    if (!config.entity) throw new Error("ha-nich-thermostat-card: 'entity' (a climate.* entity) is required");
+    this._pending = {};
+    this._config = {
+      min: 5,
+      max: 30,
+      step: 0.5,
+      accent: "#ef5350",
+      ...config,
+    };
+  }
+
+  getCardSize() {
+    return 5;
+  }
+
+  _st(id) {
+    return this.hass && id ? this.hass.states[id] : undefined;
+  }
+
+  _num(id) {
+    const s = this._st(id);
+    if (!s) return null;
+    const v = parseFloat(s.state);
+    return isNaN(v) ? null : v;
+  }
+
+  // --- actions ---------------------------------------------------------------
+  _clamp(t) {
+    const c = this._config;
+    return Math.min(c.max, Math.max(c.min, Math.round(t / c.step) * c.step));
+  }
+
+  // Commit a setpoint to HA. Used by +/- and on drag-release.
+  //
+  // When a manual_temp_entity is configured, a user-initiated setpoint change
+  // means "go to Manual mode at this temperature": we write the manual helper
+  // and flip the room's preset to "Manual" (and wake the TRV if it was off), so
+  // the room's target sensor + apply-targets hold the TRV at this value and it
+  // stays Manual until a preset/Auto is chosen again. We still push the TRV
+  // setpoint directly for an instant response (apply-targets reconciles it).
+  // Without a manual_temp_entity it falls back to a plain climate setpoint.
+  _setTemp(t) {
+    const v = this._clamp(t);
+    this._setPending("target", v); // optimistic: show it immediately
+    const c = this._config;
+
+    if (c.manual_temp_entity && c.preset_select) {
+      this._setPending("preset", "Manual");
+      // Wake the TRV if it was off, else the Manual target is ignored.
+      const climate = this._st(c.entity);
+      if (climate && climate.state === "off") {
+        this._setPending("mode", "auto");
+        this.hass.callService("climate", "set_hvac_mode", {
+          entity_id: c.entity, hvac_mode: "auto",
+        });
+      }
+      this.hass.callService("input_number", "set_value", {
+        entity_id: c.manual_temp_entity, value: v,
+      });
+      // Only switch the preset if it isn't already Manual (avoids a redundant
+      // event each drag tick).
+      if (this._currentPreset() !== "Manual") {
+        this.hass.callService("input_select", "select_option", {
+          entity_id: c.preset_select, option: "Manual",
+        });
+      }
+    }
+
+    // Push the TRV setpoint directly too, for an instant dial response.
+    this.hass.callService("climate", "set_temperature", {
+      entity_id: c.entity,
+      temperature: v,
+    });
+  }
+
+  _targetTemp() {
+    const s = this._st(this._config.entity);
+    return s ? parseFloat(s.attributes.temperature) : null;
+  }
+
+  _setMode(mode) {
+    this._setPending("mode", mode); // optimistic
+    this.hass.callService("climate", "set_hvac_mode", {
+      entity_id: this._config.entity,
+      hvac_mode: mode,
+    });
+  }
+
+  // --- preset picker ---------------------------------------------------------
+  // The "mode" button opens a picker for the room's preset input_select
+  // (Auto = run the heating algorithm/schedule; Comfort/Eco/Sleep/Cool/Off =
+  // manually pin the room). Options are read live from the entity so they
+  // always match the helper definition.
+  _presetOptions() {
+    const s = this._st(this._config.preset_select);
+    return (s && s.attributes.options) || ["Auto", "Comfort", "Eco", "Sleep", "Cool", "Off"];
+  }
+
+  _currentPreset() {
+    const s = this._st(this._config.preset_select);
+    return s ? s.state : null;
+  }
+
+  _togglePresetMenu() {
+    if (!this._config.preset_select) {
+      // No preset entity configured — fall back to just setting Auto mode.
+      this._setMode("auto");
+      return;
+    }
+    this._presetMenuOpen = !this._presetMenuOpen;
+  }
+
+  _pickPreset(opt) {
+    this._setPending("preset", opt); // optimistic
+    // If the climate is currently OFF, picking a preset should also wake the
+    // TRV back up (otherwise the preset sets a target the off TRV ignores, and
+    // the dial stays dark). Turn it back to 'auto' so it resumes responding.
+    const climate = this._st(this._config.entity);
+    if (climate && climate.state === "off") {
+      this._setPending("mode", "auto");
+      this.hass.callService("climate", "set_hvac_mode", {
+        entity_id: this._config.entity,
+        hvac_mode: "auto",
+      });
+    }
+    // Picking "Manual" from the menu: seed the manual helper from the current
+    // target so the room holds where it is until the user dials a new value
+    // (rather than jumping to a stale manual_temp).
+    if (opt === "Manual" && this._config.manual_temp_entity) {
+      const cur = this._pend("target", this._targetTemp());
+      if (cur != null && !isNaN(cur)) {
+        this.hass.callService("input_number", "set_value", {
+          entity_id: this._config.manual_temp_entity, value: this._clamp(cur),
+        });
+      }
+    }
+    this.hass.callService("input_select", "select_option", {
+      entity_id: this._config.preset_select,
+      option: opt,
+    });
+    this._presetMenuOpen = false;
+  }
+
+  _toggleUsed() {
+    if (!this._config.used_boolean) return;
+    const now = this._st(this._config.used_boolean)?.state === "on";
+    this._setPending("used", !now); // optimistic
+    this.hass.callService("input_boolean", "toggle", {
+      entity_id: this._config.used_boolean,
+    });
+  }
+
+  _toggleBoost() {
+    const c = this._config;
+    const boosting = c.boost_select ? this._st(c.boost_select)?.state === "boost" : false;
+    this._setPending("boost", !boosting); // optimistic
+    if (c.boost_script && c.boost_slug) {
+      // Use the heating_boost_toggle script (handles duration + cancel).
+      const svc = c.boost_script.split(".");
+      this.hass.callService(svc[0], svc[1], { trv_slug: c.boost_slug });
+    } else if (c.boost_select) {
+      this.hass.callService("select", "select_option", {
+        entity_id: c.boost_select,
+        option: boosting ? "disabled" : "boost",
+      });
+    }
+  }
+
+  // --- geometry for the dial -------------------------------------------------
+  _polar(cx, cy, r, angleDeg) {
+    const a = ((angleDeg - 90) * Math.PI) / 180;
+    return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+  }
+
+  // 270-degree arc from -135 to +135 (gap at the bottom).
+  _arcPath(cx, cy, r, startFrac, endFrac) {
+    const span = 270;
+    const start = -135 + span * startFrac;
+    const end = -135 + span * endFrac;
+    const s = this._polar(cx, cy, r, start);
+    const e = this._polar(cx, cy, r, end);
+    const large = end - start > 180 ? 1 : 0;
+    return `M ${s.x} ${s.y} A ${r} ${r} 0 ${large} 1 ${e.x} ${e.y}`;
+  }
+
+  // Convert a pointer position on the SVG to a temperature along the 270° arc.
+  _tempFromPointer(svg, clientX, clientY) {
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    let ang = (Math.atan2(clientY - cy, clientX - cx) * 180) / Math.PI + 90;
+    if (ang > 180) ang -= 360;
+    let frac = Math.min(1, Math.max(0, (ang + 135) / 270));
+    const c = this._config;
+    return this._clamp(c.min + frac * (c.max - c.min));
+  }
+
+  // Is the pointer on the RING (not the empty centre)? Prevents a tap on the
+  // big number / mode icon from scrubbing the setpoint. Band is a fraction of
+  // the dial radius — adapted from the original card's _isRingHit.
+  _isRingHit(svg, clientX, clientY) {
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const rad = Math.hypot(clientX - cx, clientY - cy) / (rect.width / 2 || 1);
+    return rad >= 0.55 && rad <= 1.05; // the ring annulus
+  }
+
+  // Tap-vs-drag (adapted from material-thermostat-card):
+  //  - Mouse: begin dragging immediately.
+  //  - Touch: ARM a tap; only start dragging once the finger moves past a 10px
+  //    slop, so a tap sets the point and a vertical swipe still scrolls the page
+  //    (touch-action: pan-y on the svg). A tap commits to the tapped position.
+  // Dragging previews locally (no service spam) and commits ONE call on release.
+  _onPointerDown(ev) {
+    if (this.disabled) return;
+    this._svg = ev.currentTarget;
+    if (!this._isRingHit(this._svg, ev.clientX, ev.clientY)) return;
+    this._pressX = ev.clientX;
+    this._pressY = ev.clientY;
+    if (ev.pointerType !== "touch") {
+      this._beginDrag(ev);
+    } else {
+      this._tapArmed = true;
+    }
+  }
+
+  _beginDrag(ev) {
+    ev.preventDefault();
+    this._svg.setPointerCapture?.(ev.pointerId);
+    this._tapArmed = false;
+    this._dragging = true;
+    this._dragTarget = this._tempFromPointer(this._svg, ev.clientX, ev.clientY);
+    this.requestUpdate();
+  }
+
+  _movedPastSlop(ev) {
+    return Math.hypot(ev.clientX - this._pressX, ev.clientY - this._pressY) > 10;
+  }
+
+  _onPointerMove(ev) {
+    if (this._tapArmed && this._movedPastSlop(ev)) this._beginDrag(ev);
+    if (this._dragging) {
+      this._dragTarget = this._tempFromPointer(this._svg, ev.clientX, ev.clientY);
+      this.requestUpdate(); // local preview only, no HA call
+    }
+  }
+
+  _onPointerUp(ev) {
+    if (this._tapArmed) {
+      // A clean tap (touch, no drag) — jump the setpoint to the tapped spot.
+      this._tapArmed = false;
+      this._setTemp(this._tempFromPointer(this._svg, ev.clientX, ev.clientY));
+      return;
+    }
+    if (this._dragging) {
+      this._dragging = false;
+      const t = this._dragTarget;
+      this._dragTarget = null;
+      if (t != null) this._setTemp(t); // the single committing call
+    }
+  }
+
+  _onPointerCancel() {
+    this._tapArmed = false;
+    this._dragging = false;
+    this._dragTarget = null;
+    this.requestUpdate();
+  }
+
+  render() {
+    if (!this.hass || !this._config) return LitHtml``;
+    const c = this._config;
+    const climate = this._st(c.entity);
+    if (!climate) {
+      return LitHtml`<ha-card><div class="warn">Unknown entity: ${c.entity}</div></ha-card>`;
+    }
+
+    // Prefer optimistic pending values (set the instant the user taps) over the
+    // real HA state, so the UI reacts immediately instead of waiting for the
+    // Zigbee round-trip. Pending values self-expire after ~4s.
+    const mode = this._pend("mode", climate.state); // off / auto / heat
+    const action = climate.attributes.hvac_action; // heating / idle / off
+    const realTarget = this._pend("target", parseFloat(climate.attributes.temperature));
+    // While dragging, show the live preview target instead of the committed one.
+    const target = this._dragTarget != null ? this._dragTarget : realTarget;
+    // Don't allow scrubbing the setpoint when the TRV is off/unavailable.
+    this.disabled = mode === "off" || climate.state === "unavailable" || climate.state === "unknown";
+
+    // Big number = the ROOM SENSOR (explicit entity), falling back to the
+    // climate current_temperature only if the room sensor is missing.
+    const roomV = this._num(c.current_temp_entity);
+    const climateCur = parseFloat(climate.attributes.current_temperature);
+    const bigNum = roomV ?? (isNaN(climateCur) ? null : climateCur);
+
+    // TRV internal probe for the small tile.
+    const trvV = this._num(c.trv_temp_entity);
+
+    const boosting = this._pend("boost", c.boost_select ? this._st(c.boost_select)?.state === "boost" : false);
+    const preset = this._pend("preset", this._currentPreset()); // room preset (Auto / Comfort / ...)
+    const used = this._pend("used", c.used_boolean ? this._st(c.used_boolean)?.state === "on" : null);
+    // Optional open-window warning: if the configured binary_sensor is on, the
+    // TRV has paused heating for that room (window/fast-drop detection).
+    const openWindow = c.open_window_entity && this._st(c.open_window_entity)?.state === "on";
+
+    const frac = (v) => Math.min(1, Math.max(0, (v - c.min) / (c.max - c.min)));
+    const curFrac = bigNum != null ? frac(bigNum) : null;
+    const tgtFrac = !isNaN(target) ? frac(target) : 0;
+
+    const cx = 110,
+      cy = 110,
+      r = 92;
+    const trackPath = this._arcPath(cx, cy, r, 0, 1);
+    const fillPath = this._arcPath(cx, cy, r, 0, tgtFrac);
+    // Markers use the ORBIT technique (rotated HTML divs over the dial), the
+    // same approach the material-thermostat-card uses — far more reliable than
+    // computing SVG x/y. A marker is a full-size layer rotated so its top-pinned
+    // dot lands on the arc. 0deg = top (12 o'clock); the 270° arc runs from
+    // -135deg (bottom-left) to +135deg (bottom-right).
+    const tgtDeg = -135 + 270 * tgtFrac;
+    const curDeg = curFrac != null ? -135 + 270 * curFrac : null;
+    const labelsApart = curFrac != null && Math.abs(curFrac - tgtFrac) > 0.08;
+
+    // Dial colour by what the TRV is actually DOING (hvac_action), using HA's
+    // own climate-state CSS variables so it matches the rest of the UI, with
+    // hex fallbacks. Boost = orange; actively heating = heat colour; off = grey;
+    // idle/satisfied = a muted green. (Adapted from the original's _colorMode.)
+    const halo = boosting
+      ? "#ff9800"
+      : mode === "off"
+      ? "var(--state-climate-off-color, #607d8b)"
+      : action === "heating"
+      ? "var(--state-climate-heat-color, #ff8100)"
+      : "var(--state-climate-auto-color, #66bb6a)";
+
+    return LitHtml`
+      <style>${HaNichThermostatCard.styleText}</style>
+      <ha-card style="--accent:${c.accent}; --dial-color:${halo};">
+        <div class="title">${c.name || climate.attributes.friendly_name || c.entity}</div>
+
+        ${openWindow
+          ? LitHtml`<div class="open-window">🪟 Open window — heating paused</div>`
+          : ""}
+
+        <div class="dial-wrap">
+          <svg viewBox="0 0 220 220" class="dial"
+               @pointerdown=${this._onPointerDown}
+               @pointermove=${this._onPointerMove}
+               @pointerup=${this._onPointerUp}
+               @pointercancel=${this._onPointerCancel}>
+            <defs>
+              <!-- Soft mode-coloured halo: full colour at centre, fading to
+                   transparent at the rim (adapted from the original card). -->
+              <radialGradient id="ha-nich-glow" cx="50%" cy="50%" r="50%">
+                <stop offset="0%" stop-color="${halo}" stop-opacity="0.30" />
+                <stop offset="45%" stop-color="${halo}" stop-opacity="0.14" />
+                <stop offset="75%" stop-color="${halo}" stop-opacity="0.04" />
+                <stop offset="100%" stop-color="${halo}" stop-opacity="0" />
+              </radialGradient>
+            </defs>
+            <circle class="glow" cx="110" cy="110" r="104" fill="url(#ha-nich-glow)"
+                    style="opacity:${mode === "off" ? 0.4 : 1}" />
+            <path d=${trackPath} class="track" />
+            <path d=${fillPath} class="fill" style="stroke:${halo};" />
+            <text x="110" y="104" class="big" style="fill:${halo};">
+              ${bigNum != null ? bigNum.toFixed(1) : "N/A"}<tspan class="deg">°C</tspan>
+            </text>
+            <text x="110" y="130" class="sub">
+              set ${!isNaN(target) ? target.toFixed(1) + "°" : "—"}
+            </text>
+          </svg>
+
+          <!-- Marker overlay (rotated-div "orbit" technique) over the SVG. -->
+          <div class="markers">
+            <!-- Setpoint dot (coloured) -->
+            <div class="orbit" style="transform: rotate(${tgtDeg}deg)">
+              <div class="o-dot setpoint" style="background:${halo}"></div>
+            </div>
+            ${curDeg != null
+              ? LitHtml`
+                  <!-- Current-temperature dot (white) -->
+                  <div class="orbit" style="transform: rotate(${curDeg}deg)">
+                    <div class="o-dot current"></div>
+                  </div>
+                  ${labelsApart
+                    ? LitHtml`
+                        <div class="orbit" style="transform: rotate(${curDeg}deg)">
+                          <div class="o-label" style="transform: translate(-50%,-50%) rotate(${-curDeg}deg)">
+                            ${bigNum.toFixed(1)}°
+                          </div>
+                        </div>
+                      `
+                    : ""}
+                `
+              : ""}
+          </div>
+
+          <div class="bump">
+            <button @click=${() => this._setTemp(realTarget - c.step)}>−</button>
+            <button @click=${() => this._setTemp(realTarget + c.step)}>+</button>
+          </div>
+        </div>
+
+        <div class="modes">
+          <button class="mode ${mode === "off" ? "on" : ""}"
+                  @click=${() => this._setMode(mode === "off" ? "auto" : "off")}
+                  title=${mode === "off" ? "Turn on (Auto)" : "Turn off"}>
+            <ha-icon icon="mdi:power"></ha-icon>
+          </button>
+          <button class="mode preset ${preset && preset !== "Auto" ? "manual" : mode === "auto" ? "on" : ""}"
+                  @click=${() => this._togglePresetMenu()} title="Preset / Mode">
+            <ha-icon icon=${preset === "Auto" || !preset ? "mdi:calendar-sync" : "mdi:tune-variant"}></ha-icon>
+            <span class="preset-lbl">${preset || "Auto"}</span>
+          </button>
+          <button class="mode boost ${boosting ? "on" : ""}" @click=${() => this._toggleBoost()} title="Boost">
+            <ha-icon icon="mdi:fire"></ha-icon>
+          </button>
+          ${c.used_boolean
+            ? LitHtml`
+                <button class="mode room ${used ? "on" : ""}"
+                        @click=${() => this._toggleUsed()}
+                        title=${used ? "Room in use (tap to mark unused)" : "Room unused (tap to mark in use)"}>
+                  <ha-icon icon=${used ? "mdi:account-check" : "mdi:account-off"}></ha-icon>
+                </button>
+              `
+            : ""}
+        </div>
+
+        ${this._presetMenuOpen
+          ? LitHtml`
+              <div class="preset-menu">
+                ${this._presetOptions().map(
+                  (opt) => LitHtml`
+                    <button class="preset-opt ${opt === preset ? "sel" : ""}"
+                            @click=${() => this._pickPreset(opt)}>
+                      ${opt === "Auto" ? "Auto (algorithm)" : opt}
+                      ${opt === preset ? LitHtml`<ha-icon icon="mdi:check"></ha-icon>` : ""}
+                    </button>
+                  `
+                )}
+              </div>
+            `
+          : ""}
+
+        <div class="footer">
+          <div class="dp">
+            <span class="dp-val">${trvV != null ? trvV.toFixed(1) + "°" : "—"}</span>
+            <span class="dp-lbl">TRV probe</span>
+          </div>
+          <div class="dp">
+            <span class="dp-val">${action === "heating" ? "Open" : mode === "off" ? "Off" : "Idle"}</span>
+            <span class="dp-lbl">Valve</span>
+          </div>
+        </div>
+      </ha-card>
+    `;
+  }
+
+}
+
+// Styles as a plain string injected via a <style> block in render(). We avoid
+// the static `css` tag entirely (its presence on the Lit prototype is
+// version-dependent and threw a "Configuration error"). The card is a Lit
+// component so this <style> is scoped to its shadow root.
+HaNichThermostatCard.styleText = `
+  ha-card {
+    border-left: 4px solid var(--accent, #ef5350);
+    border-radius: 18px;
+    padding: 10px 8px 8px;
+    color: var(--primary-text-color, #fff);
+    /* Per-room "funk" hue: a subtle gradient tinted to the room's accent colour
+       (set via the card's accent config), layered over the normal card bg. */
+    background:
+      linear-gradient(180deg,
+        color-mix(in srgb, var(--accent, #ef5350) 14%, transparent),
+        color-mix(in srgb, var(--accent, #ef5350) 4%, transparent)),
+      var(--ha-card-background, var(--card-background-color, #1c1c1c));
+    -webkit-tap-highlight-color: transparent;
+  }
+  .title { text-align: center; font-weight: 600; letter-spacing: .5px; padding-bottom: 4px; }
+  .open-window {
+    margin: 0 2px 6px; padding: 6px 10px; border-radius: 12px;
+    background: rgba(3,169,244,0.18); color: #e1f5fe;
+    font-size: 13px; font-weight: 600; text-align: center;
+  }
+  /* The dial + marker overlay share one centred, square box so the rotated
+     orbit layers line up exactly with the SVG arc. */
+  .dial-wrap { position: relative; width: 100%; max-width: 260px; margin: 0 auto; aspect-ratio: 1 / 1; }
+  .dial {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    /* a vertical swipe scrolls the page; a tap/drag on the ring sets the
+       temperature (the ring-hit + slop logic decides which) */
+    touch-action: pan-y; cursor: pointer; outline: none;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  .glow { pointer-events: none; transition: opacity .3s cubic-bezier(0.2,0,0,1); }
+  .track { fill: none; stroke: rgba(255,255,255,0.12); stroke-width: 10; stroke-linecap: round; }
+  .fill  { fill: none; stroke-width: 10; stroke-linecap: round; transition: stroke .3s; }
+  .big { font-size: 40px; font-weight: 300; text-anchor: middle; }
+
+  /* Marker overlay — rotated-div orbits (same technique as material-thermostat-card). */
+  .markers { position: absolute; inset: 0; pointer-events: none; }
+  .orbit {
+    position: absolute; inset: 0; transform-origin: 50% 50%;
+    transition: transform .3s cubic-bezier(0.2,0,0,1);
+  }
+  /* A dot pinned at the top-centre of the orbit; rotating the orbit sweeps it
+     around the ring. top matches the arc radius: r=92 of 220 viewBox =>
+     (110-92)/220 = 8.2% from the top edge. */
+  .o-dot {
+    position: absolute; left: 50%; top: 8.2%;
+    transform: translate(-50%, -50%); border-radius: 50%;
+  }
+  .o-dot.setpoint { width: 14px; height: 14px; box-shadow: 0 0 0 2px rgba(0,0,0,0.25); }
+  .o-dot.current  { width: 10px; height: 10px; background: #fff; box-shadow: 0 0 0 2px rgba(0,0,0,0.5); }
+  .o-label {
+    position: absolute; left: 50%; top: 16%;
+    font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.9); white-space: nowrap;
+  }
+  .deg { font-size: 16px; }
+  .sub { font-size: 13px; fill: rgba(255,255,255,0.6); text-anchor: middle; }
+  .bump { position: absolute; bottom: 14px; left: 0; right: 0; display: flex; gap: 28px; justify-content: center; }
+  .bump button {
+    width: 34px; height: 34px; border-radius: 50%; border: none;
+    background: rgba(255,255,255,0.08); color: inherit; font-size: 20px; cursor: pointer;
+  }
+  .modes { display: flex; gap: 8px; justify-content: center; margin: 6px 0; }
+  .mode {
+    flex: 1; max-width: 120px; height: 42px; border: none; border-radius: 14px; cursor: pointer;
+    background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.7);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .mode.on { background: #4caf50; color: #fff; }
+  .mode.boost.on { background: #ff9800; }
+  .mode.room.on { background: #4caf50; color: #fff; }
+  .mode.preset { gap: 6px; font-size: 13px; font-weight: 600; }
+  .mode.preset.manual { background: #3f51b5; color: #fff; }
+  .preset-lbl { line-height: 1; }
+  .preset-menu {
+    display: flex; flex-direction: column; gap: 4px; margin: 4px 2px 2px;
+    background: rgba(0,0,0,0.25); border-radius: 12px; padding: 6px;
+  }
+  .preset-opt {
+    display: flex; align-items: center; justify-content: space-between;
+    border: none; border-radius: 10px; padding: 10px 12px; cursor: pointer;
+    background: rgba(255,255,255,0.06); color: inherit; font-size: 14px;
+  }
+  .preset-opt.sel { background: #3f51b5; color: #fff; }
+  .preset-opt ha-icon { --mdc-icon-size: 18px; }
+  .footer { display: flex; gap: 8px; margin-top: 4px; }
+  .dp {
+    flex: 1; background: rgba(255,255,255,0.05); border-radius: 12px; padding: 6px 4px;
+    text-align: center; display: flex; flex-direction: column;
+  }
+  .dp-val { font-weight: 600; }
+  .dp-lbl { font-size: 11px; opacity: .6; }
+  .warn { padding: 16px; color: var(--error-color, #f44); }
+`;
+
+customElements.define("ha-nich-thermostat-card", HaNichThermostatCard);
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: "ha-nich-thermostat-card",
+  name: "HA-Nich Thermostat Card",
+  description: "Round thermostat with the room sensor as the big number and the TRV probe as a second data point.",
+});
+console.info("%c HA-NICH-THERMOSTAT-CARD v11 (manual mode) ", "background:#ef5350;color:#fff;border-radius:4px;");

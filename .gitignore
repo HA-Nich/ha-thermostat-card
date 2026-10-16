@@ -1,0 +1,35 @@
+# Belt-and-braces: never allow secrets or HA config to be committed here.
+secrets.yaml
+secrets.yml
+*.secret
+*.token
+*.pem
+*.key
+.storage/
+ip_bans.yaml
+known_devices.yaml
+configuration.yaml
+automations.yaml
+packages/
+customize/
+custom_components/
+dashboards/
+.env
+*.log
+
+# Never publish Kiro specs, planning/review artifacts, changelogs or reference docs.
+# These are local-only working documents and must never reach this public repo.
+docs/
+.kiro/
+.agents/
+*.spec.md
+SPEC.md
+CHANGELOG.md
+CHANGELOG.*
+*.plan.md
+*.review.md
+.plan.*
+.review.*
+.audit/
+device-specs.md
+ARCHITECTURE.md
