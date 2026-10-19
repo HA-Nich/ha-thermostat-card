@@ -30,6 +30,7 @@
  *   boost_script: script.heating_boost_toggle
  *   boost_slug: bedroom_1_trv
  *   open_window_entity: binary_sensor.bedroom_1_trv_open_window_detected  # optional
+ *   calling_entity: sensor.heating_rooms_calling  # optional — see _isCalling()
  *   accent: "#42a5f5"
  */
 
@@ -95,6 +96,29 @@ class HaNichThermostatCard extends LitElement {
     if (!s) return null;
     const v = parseFloat(s.state);
     return isNaN(v) ? null : v;
+  }
+
+  // Is THIS room in the house's own "genuinely calling" list? Reads the
+  // `rooms` attribute of sensor.heating_rooms_calling (packages/heating/
+  // sensors.yaml), a comma-joined string of room labels such as "Kitchen,
+  // Shower Room" that already uses the exact same labels as this card's
+  // `name` config. This is deliberately separate from hvac_action: the TRV's
+  // own valve can be open while fine-trimming the last fraction of a degree
+  // without the room being "calling" by the house-wide weighted/deadband
+  // rule, and that looseness is intentional (see sensors.yaml). Returns null
+  // (unknown) if no calling_entity is configured, so the caller can fall
+  // back to the old hvac_action-driven behaviour.
+  _isCalling() {
+    const c = this._config;
+    if (!c.calling_entity) return null;
+    const s = this._st(c.calling_entity);
+    const list = s?.attributes?.rooms;
+    if (!list) return false;
+    const label = c.name;
+    return list
+      .split(",")
+      .map((r) => r.trim())
+      .includes(label);
   }
 
   // --- actions ---------------------------------------------------------------
@@ -394,15 +418,23 @@ class HaNichThermostatCard extends LitElement {
     const curDeg = curFrac != null ? -135 + 270 * curFrac : null;
     const labelsApart = curFrac != null && Math.abs(curFrac - tgtFrac) > 0.08;
 
-    // Dial colour by what the TRV is actually DOING (hvac_action), using HA's
-    // own climate-state CSS variables so it matches the rest of the UI, with
-    // hex fallbacks. Boost = orange; actively heating = heat colour; off = grey;
-    // idle/satisfied = a muted green. (Adapted from the original's _colorMode.)
+    // Dial colour (glow/halo): driven by the house's own "genuinely calling"
+    // decision (sensor.heating_rooms_calling, via _isCalling()), NOT by the
+    // TRV's raw hvac_action. The TRV can leave its valve open fine-trimming
+    // the last fraction of a degree without the room being "calling" by the
+    // house-wide weighted/deadband rule, and that's intentional (see
+    // _isCalling() above) — the dial shouldn't look like it's "in trouble"
+    // for a room the house considers satisfied. hvac_action still drives the
+    // separate Open/Idle/Off text label below, unchanged.
+    // Falls back to the old hvac_action-driven colour if no calling_entity is
+    // configured for this card (e.g. during rollout) so nothing goes dark.
+    const calling = this._isCalling();
+    const isHeatingNow = calling != null ? calling : action === "heating";
     const halo = boosting
       ? "#ff9800"
       : mode === "off"
       ? "var(--state-climate-off-color, #607d8b)"
-      : action === "heating"
+      : isHeatingNow
       ? "var(--state-climate-heat-color, #ff8100)"
       : "var(--state-climate-auto-color, #66bb6a)";
 
@@ -638,4 +670,4 @@ window.customCards.push({
   name: "HA-Nich Thermostat Card",
   description: "Round thermostat with the room sensor as the big number and the TRV probe as a second data point.",
 });
-console.info("%c HA-NICH-THERMOSTAT-CARD v11 (manual mode) ", "background:#ef5350;color:#fff;border-radius:4px;");
+console.info("%c HA-NICH-THERMOSTAT-CARD v12 (calling-based glow) ", "background:#ef5350;color:#fff;border-radius:4px;");
