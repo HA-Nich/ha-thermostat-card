@@ -11,7 +11,8 @@
  * value at an explicit entity.
  *
  *   - Big centre number   -> current_temp_entity   (the room sensor)
- *   - Setpoint on the ring -> climate entity's target (drag / +-/ writes it)
+ *   - White dot on the ring -> climate entity's target (drag / +-/ writes it)
+ *   - Coloured arc + end handle -> current room temperature (room sensor)
  *   - Small bottom tile    -> trv_temp_entity       (the TRV internal probe)
  *   - Off / Auto buttons   -> climate hvac_mode
  *   - Boost flame          -> boost_select (SONOFF temporary_mode_mode) via a
@@ -19,6 +20,34 @@
  *
  * No build step: plain JS using the LitElement that Home Assistant already
  * ships on the frontend. Drop in config/www/ and add as a dashboard resource.
+ *
+ * Changelog (card has no version string; patch-level changes):
+ *   - Colour-graded dial: the 270deg arc is now a colour gradient keyed to
+ *     ABSOLUTE temperature (default 15 blue, 16.5 light blue, 18 amber, 20-21
+ *     green, 22 red; override with `color_stops: [[15,"#2962ff"], ...]`). The
+ *     whole scale is drawn dim; the same gradient at full brightness is
+ *     revealed from the dial minimum up to the CURRENT room temperature. The
+ *     round end handle and the big number take the gradient colour at the
+ *     current temperature (the halo/glow is unchanged). The white dot is still
+ *     the set point and drag handle.
+ *   - Dial range: minimum/maximum now default to 15/22 (was 5/30) and can be
+ *     read LIVE from input_numbers via `min_entity` / `max_entity` (e.g. the
+ *     house cold floor and ceiling), falling back to static `min` / `max`.
+ *     A max_entity value that is non-numeric or less than min + 3 is ignored
+ *     (the ceiling helper uses low values to mean "no ceiling"); if min >= max
+ *     the range falls back to 15/22. Targets outside the range (e.g. a 5C
+ *     frost guard) pin the white dot to the nearest end; dragging, tapping and
+ *     +/- can only set targets inside the live range.
+ *   - Note: a max_entity below min + 3 (i.e. under 18 with the default minimum)
+ *     is ignored by the dial, even though the heating package treats a ceiling
+ *     of 16 or more as real; such a ceiling still caps targets, but the dial
+ *     keeps showing the static max.
+ *   - +/- never move a target the wrong way: a 5C frost target ignores "-" and
+ *     "+" moves it to the dial minimum. Per-instance SVG ids are used.
+ *   - Dial swap: the WHITE DOT now marks the set point (target) and the
+ *     coloured ARC (with its end handle) shows the current room-sensor
+ *     temperature. Previously the other way round. Arc is hidden when the
+ *     room temperature is unavailable. Dragging/tapping still sets the target.
  *
  * Example:
  *   type: custom:ha-nich-thermostat-card
@@ -31,8 +60,94 @@
  *   boost_slug: bedroom_1_trv
  *   open_window_entity: binary_sensor.bedroom_1_trv_open_window_detected  # optional
  *   calling_entity: sensor.heating_rooms_calling  # optional — see _isCalling()
+ *   min_entity: input_number.heating_cold_floor    # optional, live dial minimum
+ *   max_entity: input_number.heating_house_ceiling # optional, live dial maximum
+ *   color_stops: [[15, "#2962ff"], [22, "#e53935"]] # optional, see defaults below
  *   accent: "#42a5f5"
  */
+
+// <pure-helpers>
+// Pure functions (no DOM / hass access) so they can be unit-tested in Node.
+const NICH_DEFAULT_MIN = 15;
+const NICH_DEFAULT_MAX = 22;
+const NICH_MIN_SPAN = 3; // a max_entity closer than this to the minimum is ignored
+const NICH_DEFAULT_STOPS = [
+  [15, "#2962ff"],
+  [16.5, "#29b6f6"],
+  [18, "#ffb300"],
+  [20, "#43a047"],
+  [21, "#43a047"],
+  [22, "#e53935"],
+];
+
+function nichHexToRgb(hex) {
+  let h = String(hex).trim().replace(/^#/, "");
+  if (h.length === 3) h = h.split("").map((ch) => ch + ch).join("");
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+
+// Validate a colour-stop list; returns the sorted list or the defaults.
+function nichNormaliseStops(stops) {
+  if (!Array.isArray(stops) || stops.length < 1) return NICH_DEFAULT_STOPS;
+  const out = [];
+  for (const s of stops) {
+    if (!Array.isArray(s)) return NICH_DEFAULT_STOPS;
+    const t = Number(s[0]);
+    if (!isFinite(t) || !nichHexToRgb(s[1])) return NICH_DEFAULT_STOPS;
+    out.push([t, s[1]]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+
+// Colour at an absolute temperature: linear RGB interpolation, clamped outside.
+function nichColourAt(stops, t) {
+  const first = stops[0];
+  const last = stops[stops.length - 1];
+  const rgb = (v) => {
+    const [r, g, b] = nichHexToRgb(v);
+    return [r, g, b];
+  };
+  let c;
+  if (t <= first[0]) c = rgb(first[1]);
+  else if (t >= last[0]) c = rgb(last[1]);
+  else {
+    for (let i = 1; i < stops.length; i++) {
+      if (t <= stops[i][0]) {
+        const [t0, c0] = stops[i - 1];
+        const [t1, c1] = stops[i];
+        const k = t1 === t0 ? 1 : (t - t0) / (t1 - t0);
+        const a = rgb(c0);
+        const b = rgb(c1);
+        c = a.map((v, j) => v + (b[j] - v) * k);
+        break;
+      }
+    }
+  }
+  return "#" + c.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("");
+}
+
+// Temperature -> dial angle (0deg = 12 o'clock, -135 .. +135), clamped.
+function nichTempToDeg(t, min, max) {
+  return -135 + 270 * Math.min(1, Math.max(0, (t - min) / (max - min)));
+}
+
+// Resolve the live dial range. `num(id)` returns a finite number or null.
+function nichResolveRange(cfg, num) {
+  const fin = (v) => (typeof v === "number" && isFinite(v) ? v : null);
+  const staticMin = fin(Number(cfg.min)) ?? NICH_DEFAULT_MIN;
+  const staticMax = fin(Number(cfg.max)) ?? NICH_DEFAULT_MAX;
+  let min = (cfg.min_entity ? fin(num(cfg.min_entity)) : null) ?? staticMin;
+  let max = staticMax;
+  const liveMax = cfg.max_entity ? fin(num(cfg.max_entity)) : null;
+  if (liveMax != null && liveMax >= min + NICH_MIN_SPAN) max = liveMax;
+  if (!(min < max)) {
+    min = NICH_DEFAULT_MIN;
+    max = NICH_DEFAULT_MAX;
+  }
+  return { min, max };
+}
+// </pure-helpers>
 
 // Grab LitElement + the `html` tag from Home Assistant's own bundled Lit, so
 // this card needs no build step and no external dependencies. We resolve
@@ -75,12 +190,20 @@ class HaNichThermostatCard extends LitElement {
     if (!config.entity) throw new Error("ha-nich-thermostat-card: 'entity' (a climate.* entity) is required");
     this._pending = {};
     this._config = {
-      min: 5,
-      max: 30,
+      min: NICH_DEFAULT_MIN,
+      max: NICH_DEFAULT_MAX,
       step: 0.5,
       accent: "#ef5350",
       ...config,
     };
+    this._stops = nichNormaliseStops(this._config.color_stops);
+  }
+
+  // The single place the dial range is resolved: live min_entity / max_entity
+  // when set and valid, else static min / max, else 15/22. Used by _clamp, the
+  // pointer mapping and render()'s frac().
+  _range() {
+    return nichResolveRange(this._config, (id) => this._num(id));
   }
 
   getCardSize() {
@@ -122,9 +245,27 @@ class HaNichThermostatCard extends LitElement {
   }
 
   // --- actions ---------------------------------------------------------------
-  _clamp(t) {
+  _clamp(t, rng = this._range()) {
     const c = this._config;
-    return Math.min(c.max, Math.max(c.min, Math.round(t / c.step) * c.step));
+    return Math.min(rng.max, Math.max(rng.min, Math.round(t / c.step) * c.step));
+  }
+
+  // Per-instance SVG ids so several cards on one page can never clash.
+  _id(name) {
+    HaNichThermostatCard._n = HaNichThermostatCard._n || 0;
+    this._uid = this._uid || `ha-nich-${++HaNichThermostatCard._n}`;
+    return `${this._uid}-${name}`;
+  }
+
+  // +/- buttons: step from the current target, but never in the wrong
+  // direction. A target outside the live dial range (e.g. a 5C frost guard)
+  // is ignored by the opposite button and moves into range with the
+  // matching one, rather than jumping across the dial.
+  _stepTemp(cur, dir) {
+    if (cur == null || isNaN(cur)) return;
+    const rng = this._range();
+    if ((dir < 0 && cur <= rng.min) || (dir > 0 && cur >= rng.max)) return;
+    this._setTemp(cur + dir * this._config.step);
   }
 
   // Commit a setpoint to HA. Used by +/- and on drag-release.
@@ -227,7 +368,7 @@ class HaNichThermostatCard extends LitElement {
       const cur = this._pend("target", this._targetTemp());
       if (cur != null && !isNaN(cur)) {
         this.hass.callService("input_number", "set_value", {
-          entity_id: this._config.manual_temp_entity, value: this._clamp(cur),
+          entity_id: this._config.manual_temp_entity, value: cur,
         });
       }
     }
@@ -288,8 +429,8 @@ class HaNichThermostatCard extends LitElement {
     let ang = (Math.atan2(clientY - cy, clientX - cx) * 180) / Math.PI + 90;
     if (ang > 180) ang -= 360;
     let frac = Math.min(1, Math.max(0, (ang + 135) / 270));
-    const c = this._config;
-    return this._clamp(c.min + frac * (c.max - c.min));
+    const rng = this._range();
+    return this._clamp(rng.min + frac * (rng.max - rng.min), rng);
   }
 
   // Is the pointer on the RING (not the empty centre)? Prevents a tap on the
@@ -365,6 +506,29 @@ class HaNichThermostatCard extends LitElement {
     this.requestUpdate();
   }
 
+  // Build the gradient arc segments (~54 butt-capped 5deg paths, each coloured
+  // by the temperature at its midpoint) once per range/stops change. SVG has no
+  // conic gradient. Segments overlap by a hair so no seams show.
+  updated(changed) {
+    super.updated?.(changed);
+    const g = this.shadowRoot?.getElementById(this._id("segs"));
+    if (!g || !this._segKey || g.dataset.key === this._segKey) return;
+    const rng = this._range();
+    const N = 54;
+    const NS = "http://www.w3.org/2000/svg";
+    while (g.firstChild) g.removeChild(g.firstChild);
+    for (let i = 0; i < N; i++) {
+      const t = rng.min + ((i + 0.5) / N) * (rng.max - rng.min);
+      const p = document.createElementNS(NS, "path");
+      p.setAttribute("d", this._arcPath(110, 110, 92, i / N, Math.min(1, (i + 1) / N + 0.004)));
+      p.setAttribute("stroke", nichColourAt(this._stops, t));
+      p.setAttribute("fill", "none");
+      p.setAttribute("stroke-width", "10");
+      g.appendChild(p);
+    }
+    g.dataset.key = this._segKey;
+  }
+
   render() {
     if (!this.hass || !this._config) return LitHtml``;
     const c = this._config;
@@ -400,15 +564,30 @@ class HaNichThermostatCard extends LitElement {
     // TRV has paused heating for that room (window/fast-drop detection).
     const openWindow = c.open_window_entity && this._st(c.open_window_entity)?.state === "on";
 
-    const frac = (v) => Math.min(1, Math.max(0, (v - c.min) / (c.max - c.min)));
+    const rng = this._range(); // live dial range, resolved once for this render
+    const frac = (v) => Math.min(1, Math.max(0, (v - rng.min) / (rng.max - rng.min)));
     const curFrac = bigNum != null ? frac(bigNum) : null;
     const tgtFrac = !isNaN(target) ? frac(target) : 0;
 
     const cx = 110,
       cy = 110,
       r = 92;
-    const trackPath = this._arcPath(cx, cy, r, 0, 1);
-    const fillPath = this._arcPath(cx, cy, r, 0, tgtFrac);
+    // Gradient colour at the current temperature (big number + end handle).
+    const curColour = bigNum != null ? nichColourAt(this._stops, bigNum) : null;
+    // Bright layer is a clip sector from the dial centre, from the dial
+    // minimum (-135deg) up to the current temperature. Empty if unavailable.
+    const clipEnd = curFrac != null ? nichTempToDeg(bigNum, rng.min, rng.max) : -135;
+    const sA = this._polar(cx, cy, 120, -135);
+    const sB = this._polar(cx, cy, 120, clipEnd);
+    const clipPath = `M ${cx} ${cy} L ${sA.x} ${sA.y} A 120 120 0 ${clipEnd + 135 > 180 ? 1 : 0} 1 ${sB.x} ${sB.y} Z`;
+    const capA = this._polar(cx, cy, r, -135);
+    const capB = this._polar(cx, cy, r, 135);
+    const colMin = nichColourAt(this._stops, rng.min);
+    const colMax = nichColourAt(this._stops, rng.max);
+    // The ~54 gradient segments are built imperatively in updated() (nested
+    // Lit html templates would be parsed as HTML, not SVG); this key says when
+    // they need rebuilding.
+    this._segKey = `${rng.min}|${rng.max}|${JSON.stringify(this._stops)}`;
     // Markers use the ORBIT technique (rotated HTML divs over the dial), the
     // same approach the material-thermostat-card uses — far more reliable than
     // computing SVG x/y. A marker is a full-size layer rotated so its top-pinned
@@ -456,18 +635,33 @@ class HaNichThermostatCard extends LitElement {
             <defs>
               <!-- Soft mode-coloured halo: full colour at centre, fading to
                    transparent at the rim (adapted from the original card). -->
-              <radialGradient id="ha-nich-glow" cx="50%" cy="50%" r="50%">
+              <radialGradient id="${this._id("glow")}" cx="50%" cy="50%" r="50%">
                 <stop offset="0%" stop-color="${halo}" stop-opacity="0.30" />
                 <stop offset="45%" stop-color="${halo}" stop-opacity="0.14" />
                 <stop offset="75%" stop-color="${halo}" stop-opacity="0.04" />
                 <stop offset="100%" stop-color="${halo}" stop-opacity="0" />
               </radialGradient>
+              <!-- Gradient arc segments (filled in updated()), used twice:
+                   dim full track + bright layer clipped to the current temp. -->
+              <g id="${this._id("segs")}" class="segs"></g>
+              <clipPath id="${this._id("clip")}"><path d=${clipPath} /></clipPath>
             </defs>
-            <circle class="glow" cx="110" cy="110" r="104" fill="url(#ha-nich-glow)"
+            <circle class="glow" cx="110" cy="110" r="104" fill="url(#${this._id("glow")})"
                     style="opacity:${mode === "off" ? 0.4 : 1}" />
-            <path d=${trackPath} class="track" />
-            <path d=${fillPath} class="fill" style="stroke:${halo};" />
-            <text x="110" y="104" class="big" style="fill:${halo};">
+            <!-- Dim full-scale gradient track (with rounded end caps) -->
+            <g class="track" opacity="0.22">
+              <use href="#${this._id("segs")}" />
+              <circle cx=${capA.x} cy=${capA.y} r="5" fill=${colMin} />
+              <circle cx=${capB.x} cy=${capB.y} r="5" fill=${colMax} />
+            </g>
+            <!-- Bright gradient, revealed from the dial minimum to the current temp -->
+            <g class="fill" style="display:${curFrac != null ? "inline" : "none"}">
+              <g clip-path="url(#${this._id("clip")})"><use href="#${this._id("segs")}" /></g>
+              <circle cx=${capA.x} cy=${capA.y} r="5" fill=${colMin} />
+              <circle cx=${capB.x} cy=${capB.y} r="5" fill=${colMax}
+                      style="display:${curFrac != null && curFrac >= 1 ? "inline" : "none"}" />
+            </g>
+            <text x="110" y="104" class="big" style="fill:${curColour || halo};">
               ${bigNum != null ? bigNum.toFixed(1) : "N/A"}<tspan class="deg">°C</tspan>
             </text>
             <text x="110" y="130" class="sub">
@@ -477,15 +671,11 @@ class HaNichThermostatCard extends LitElement {
 
           <!-- Marker overlay (rotated-div "orbit" technique) over the SVG. -->
           <div class="markers">
-            <!-- Setpoint dot (coloured) -->
-            <div class="orbit" style="transform: rotate(${tgtDeg}deg)">
-              <div class="o-dot setpoint" style="background:${halo}"></div>
-            </div>
             ${curDeg != null
               ? LitHtml`
-                  <!-- Current-temperature dot (white) -->
+                  <!-- Current-temperature end handle (coloured, end of the arc) -->
                   <div class="orbit" style="transform: rotate(${curDeg}deg)">
-                    <div class="o-dot current"></div>
+                    <div class="o-dot current" style="background:${curColour}"></div>
                   </div>
                   ${labelsApart
                     ? LitHtml`
@@ -498,11 +688,15 @@ class HaNichThermostatCard extends LitElement {
                     : ""}
                 `
               : ""}
+            <!-- Setpoint dot (white) — drawn last so it sits on top -->
+            <div class="orbit" style="transform: rotate(${tgtDeg}deg)">
+              <div class="o-dot setpoint"></div>
+            </div>
           </div>
 
           <div class="bump">
-            <button @click=${() => this._setTemp(realTarget - c.step)}>−</button>
-            <button @click=${() => this._setTemp(realTarget + c.step)}>+</button>
+            <button @click=${() => this._stepTemp(realTarget, -1)}>−</button>
+            <button @click=${() => this._stepTemp(realTarget, 1)}>+</button>
           </div>
         </div>
 
@@ -600,8 +794,8 @@ HaNichThermostatCard.styleText = `
     -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
   }
   .glow { pointer-events: none; transition: opacity .3s cubic-bezier(0.2,0,0,1); }
-  .track { fill: none; stroke: rgba(255,255,255,0.12); stroke-width: 10; stroke-linecap: round; }
-  .fill  { fill: none; stroke-width: 10; stroke-linecap: round; transition: stroke .3s; }
+  /* Gradient arc: segments carry their own stroke colour (set in updated()). */
+  .segs path { fill: none; stroke-width: 10; stroke-linecap: butt; }
   .big { font-size: 40px; font-weight: 300; text-anchor: middle; }
 
   /* Marker overlay — rotated-div orbits (same technique as material-thermostat-card). */
@@ -617,8 +811,8 @@ HaNichThermostatCard.styleText = `
     position: absolute; left: 50%; top: 8.2%;
     transform: translate(-50%, -50%); border-radius: 50%;
   }
-  .o-dot.setpoint { width: 14px; height: 14px; box-shadow: 0 0 0 2px rgba(0,0,0,0.25); }
-  .o-dot.current  { width: 10px; height: 10px; background: #fff; box-shadow: 0 0 0 2px rgba(0,0,0,0.5); }
+  .o-dot.setpoint { width: 14px; height: 14px; background: #fff; box-shadow: 0 0 0 2px rgba(0,0,0,0.5); }
+  .o-dot.current  { width: 12px; height: 12px; box-shadow: 0 0 0 2px rgba(0,0,0,0.25); }
   .o-label {
     position: absolute; left: 50%; top: 16%;
     font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.9); white-space: nowrap;
@@ -670,4 +864,4 @@ window.customCards.push({
   name: "HA-Nich Thermostat Card",
   description: "Round thermostat with the room sensor as the big number and the TRV probe as a second data point.",
 });
-console.info("%c HA-NICH-THERMOSTAT-CARD v12 (calling-based glow) ", "background:#ef5350;color:#fff;border-radius:4px;");
+console.info("%c HA-NICH-THERMOSTAT-CARD v13 (colour-graded arc) ", "background:#ef5350;color:#fff;border-radius:4px;");
