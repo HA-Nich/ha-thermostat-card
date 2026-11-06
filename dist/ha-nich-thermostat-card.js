@@ -763,7 +763,6 @@ class HaNichThermostatCard extends LitElement {
 // component so this <style> is scoped to its shadow root.
 HaNichThermostatCard.styleText = `
   ha-card {
-    border-left: 4px solid var(--accent, #ef5350);
     border-radius: 18px;
     padding: 10px 8px 8px;
     color: var(--primary-text-color, #fff);
@@ -864,4 +863,4 @@ window.customCards.push({
   name: "HA-Nich Thermostat Card",
   description: "Round thermostat with the room sensor as the big number and the TRV probe as a second data point.",
 });
-console.info("%c HA-NICH-THERMOSTAT-CARD v13 (colour-graded arc) ", "background:#ef5350;color:#fff;border-radius:4px;");
+console.info("%c HA-NICH-THERMOSTAT-CARD v14 (no left stripe) ", "background:#ef5350;color:#fff;border-radius:4px;");
